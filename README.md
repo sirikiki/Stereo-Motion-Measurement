@@ -19,7 +19,7 @@ A Windows desktop application for tracking a black circular marker, visualizing 
 </div>
 
 <!-- After uploading your own screenshot, uncomment this line. -->
-![Stereo preview, live XYZ, and 3D trajectory](docs/images/front-page.png)
+![Stereo preview, live XYZ, and 3D trajectory](docs/images/tracking-demo.gif)
 
 ## Overview
 
