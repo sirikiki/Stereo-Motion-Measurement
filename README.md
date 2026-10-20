@@ -130,7 +130,7 @@ Incoming frame size must match calibration. Keep the complete original NPZ for o
 | **Playback** | CSV loading, play/pause, seeking, 0.25× / 0.5× / 1× / 2× speeds, direct access to curves and return |
 | **Settings** | English/Simplified Chinese, camera index, depth limits, video, diagnostic images, reference protection |
 
-Both interface languages use **Microsoft YaHei**. Collapse the sidebar or independently hide images, trajectory, XYZ, and detection overlays. Hiding a display does not stop measurement and saving.
+Collapse the sidebar or independently hide images, trajectory, XYZ, and detection overlays. Hiding a display does not stop measurement and saving.
 
 ## Using the application
 
