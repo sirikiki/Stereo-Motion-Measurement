@@ -1,0 +1,12 @@
+_internal/
+*.exe
+build/
+dist/
+.venv/
+__pycache__/
+*.pyc
+data/
+logs/
+recycle_bin/
+config/settings.json
+*.log

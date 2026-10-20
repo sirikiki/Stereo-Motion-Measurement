@@ -1,0 +1,13 @@
+{
+  "language": "en",
+  "camera_index": 1,
+  "trail_seconds": 10,
+  "record_video": false,
+  "reference_mm": 100,
+  "calibration": "calibration/stereo_calibration.npz",
+  "diagnostic_images": true,
+  "display_alignment": "camera",
+  "depth_min_m": 0.2,
+  "depth_max_m": 3,
+  "stop_on_camera_motion": true
+}
