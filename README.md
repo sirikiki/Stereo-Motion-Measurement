@@ -155,7 +155,7 @@ Collapse the sidebar or independently hide images, trajectory, XYZ, and detectio
 
 The full current-session trajectory is retained rather than disappearing after a rolling time window. Very long recordings can therefore increase memory and rendering cost.
 
-<!-- SCREENSHOT: docs/images/monitor.png — meaningful real black-circle motion and a visible trajectory. -->
+![Stereo camera views and live 3D trajectory](docs/images/monitor.png)
 
 ### Time plots
 
@@ -163,7 +163,7 @@ Choose **Time plots** to inspect X, Y, and Z against elapsed time. Select the cu
 
 Plots can reveal depth changes or cross-axis motion that is difficult to judge from a 3D viewing angle. From **Playback**, the blue **Time plots** button opens the loaded recording's curves; **Back** returns to playback.
 
-<!-- SCREENSHOT: docs/images/time-plots.png — a deliberate X/Y/Z motion sequence. -->
+![a deliberate X/Y/Z motion sequence.](docs/images/time-plots.png)
 
 ### Optional environment reference
 
@@ -193,7 +193,7 @@ References can be reused across sessions while the application and reference wor
 
 **Reference protection** uses background features and repeated geometric consistency checks to look for camera movement. By default, confirmation clears the reference, stops and saves tracking, and shows an alert. With **Stop tracking when camera movement is confirmed** disabled, raw recording continues while invalid environment-coordinate display is suspended. A scene with insufficient background information can prevent reliable movement detection.
 
-<!-- SCREENSHOT: docs/images/environment-reference.png — accepted plane(s), not an unconfirmed red candidate. -->
+![accepted plane(s), not an unconfirmed red candidate.](docs/images/environment-reference.png)
 
 ### Accuracy validation: A1 → B → A2
 
@@ -222,7 +222,7 @@ Use **Play session** or **Playback → Open CSV / session** to replay. Stop acti
 
 **Continuous video is not synchronized into playback in this release.** Coordinates and trajectories can play without video. A CSV without its report can be loaded, but missing metadata limits reconstruction of the original reference context.
 
-<!-- SCREENSHOT: docs/images/playback.png — a saved session with its timeline near the end. -->
+![a saved session with its timeline near the end.](docs/images/playback.png)
 
 ### Settings
 
@@ -235,7 +235,7 @@ Use **Play session** or **Playback → Open CSV / session** to replay. Stop acti
 
 Click **Save settings** after changing acquisition options. Acquisition parameters are locked during tracking; visibility and the 3D view remain adjustable.
 
-<!-- SCREENSHOT: docs/images/settings.png — English selected, no private paths visible. -->
+![English selected, no private paths visible.](docs/images/settings.png)
 
 ## Coordinates and reference frames
 
