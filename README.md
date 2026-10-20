@@ -456,7 +456,7 @@ Developed with AI-assisted software coding and debugging alongside hands-on setu
 
 <div align="center">
 
-**A software developed by Siri.y — and no, not *that* Siri on your iPhone.**
+**A software developed by Siri.y — and no, not *that* Siri on your iPhone :D**
 
 Built for experiments that can be inspected, replayed, and questioned.
 
