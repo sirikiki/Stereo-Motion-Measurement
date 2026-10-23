@@ -71,6 +71,30 @@ def table(headers):
     w.setAlternatingRowColors(True)
     return w
 
+class CenteredAxisItem(pg.AxisItem):
+    """Relayout rotated text when its content changes without an axis resize."""
+    def _updateLabel(self):
+        super()._updateLabel()
+        self.resizeEvent()
+
+
+def application_icon():
+    for path in (ROOT / 'assets/app.ico', Path(__file__).resolve().parent / 'assets/app.ico'):
+        candidate = QIcon(str(path))
+        if not candidate.isNull():
+            return candidate
+    return QIcon()
+
+
+def configure_windows_identity():
+    if sys.platform != 'win32':
+        return
+    import ctypes
+    result = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Siriy.StereoMotionMeasurement')
+    if result != 0:
+        logging.warning('Windows app identity returned %s', result)
+
+
 class Window(QMainWindow):
 
     def __init__(self):
@@ -113,11 +137,11 @@ class Window(QMainWindow):
         self.expanded = False
         self.stage_busy = False
         self.last_chart = 0
+        self._curve_key = None
         self.current_error = None
         self.normal_split_sizes = [310, 370]
-        self.setWindowTitle('Stereo Motion Measurement')
-        if (ROOT / 'assets/app.ico').exists():
-            self.setWindowIcon(QIcon(str(ROOT / 'assets/app.ico')))
+        self.setWindowTitle(tr('双目运动测量'))
+        self.setWindowIcon(application_icon())
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1440, screen.width() - 40), min(900, screen.height() - 60))
         self.setMinimumSize(1000, 680)
@@ -135,7 +159,8 @@ class Window(QMainWindow):
         self.menu.setFixedSize(34, 32)
         bar.addWidget(self.menu)
         bar.addSpacing(8)
-        bar.addWidget(label('Stereo Motion Measurement', 'title'))
+        self.brand_title = label(tr('双目运动测量'), 'title')
+        bar.addWidget(self.brand_title)
         bar.addStretch()
         self.camera_button = button(tr('相机开启'), self.toggle_camera)
         self.camera_button.setIcon(icon('camera', '#c74852'))
@@ -158,9 +183,9 @@ class Window(QMainWindow):
         side.addWidget(label(tr('工作空间'), 'muted'))
         side.addSpacing(8)
         self.nav = []
-        self.page_ids = ['monitor', 'environment', 'curves', 'precision', 'records', 'replay', 'settings']
-        self.nav_icons = ['eye', 'planes', 'timer', 'percent', 'clipboard', 'play', 'gear']
-        for i, name in enumerate([tr('监视'), tr('环境基准'), tr('时间曲线'), tr('精度验证'), tr('实验记录'), tr('数据回放'), tr('设置')]):
+        self.page_ids = ['monitor', 'environment', 'curves', 'precision', 'records', 'replay', 'camera_setup', 'settings']
+        self.nav_icons = ['eye', 'planes', 'timer', 'percent', 'clipboard', 'play', 'camera', 'gear']
+        for i, name in enumerate([tr('监视'), tr('环境基准'), tr('时间曲线'), tr('精度验证'), tr('实验记录'), tr('数据回放'), tr('相机配置'), tr('设置')]):
             b = button(name, lambda checked=False, n=self.page_ids[i]: self.navigate(n), 'nav')
             b.setCheckable(True)
             b.setIcon(icon(self.nav_icons[i]))
@@ -193,6 +218,7 @@ class Window(QMainWindow):
         self.make_precision()
         self.make_records()
         self.make_replay()
+        self.make_camera_setup()
         self.make_settings()
         self.apply_display_frame()
         footer = QFrame()
@@ -210,6 +236,8 @@ class Window(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
+        from windows_taskbar import TaskbarGuard
+        self.taskbar_guard = TaskbarGuard(self, ROOT)
         QShortcut(QKeySequence('Escape'), self, activated=self.escape_view)
         self.navigate('monitor')
         self.refresh_records()
@@ -275,8 +303,63 @@ class Window(QMainWindow):
         mode_row = QHBoxLayout()
         self.env_board = button(tr('棋盘格辅助'), self.environment_board_changed)
         self.env_board.setCheckable(True)
-        self.env_board.setToolTip(tr('可选：10×7方格、单格25毫米。纸需贴平目标表面；不重做相机标定。'))
+        self.env_board.setToolTip(tr('自动识别棋盘格；可选输入方格列数、行数和格长。格长不是定向必需项。'))
         mode_row.addWidget(self.env_board)
+        self.board_fields = QScrollArea()
+        self.board_fields.setWidgetResizable(True)
+        self.board_fields.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.board_fields.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.board_fields.setFixedHeight(53)
+        board_policy = self.board_fields.sizePolicy()
+        board_policy.setRetainSizeWhenHidden(True)
+        self.board_fields.setSizePolicy(board_policy)
+        self.board_fields.setMinimumWidth(0)
+        editor = QWidget()
+        self.board_fields.setWidget(editor)
+        self.board_fields.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }")
+        self.board_fields.viewport().setAutoFillBackground(False)
+        editor.setAutoFillBackground(False)
+        editor.setObjectName('boardInputEditor')
+        editor.setStyleSheet("QWidget#boardInputEditor { background: transparent; } QLineEdit { background: white; }")
+        fields = QHBoxLayout(editor)
+        fields.setSpacing(5)
+        fields.setContentsMargins(0, 0, 0, 0)
+        self.board_cols = QLineEdit()
+        self.board_rows = QLineEdit()
+        self.board_square = QLineEdit()
+        self.board_square_height = QLineEdit()
+        from PySide6.QtGui import QIntValidator, QDoubleValidator
+        for field in (self.board_cols, self.board_rows):
+            field.setValidator(QIntValidator(0, 50, field))
+            field.setPlaceholderText(tr('自动'))
+            field.setToolTip(tr('黑白方格数量，不是内角点。至少4；0表示自动。'))
+        counts_label = label(tr('方格数'))
+        counts_label.setToolTip(tr('方格数量（列×行）'))
+        fields.addWidget(counts_label)
+        fields.addWidget(self.board_cols)
+        fields.addWidget(label('×'))
+        fields.addWidget(self.board_rows)
+        size_label = label(tr('单格 mm'))
+        size_label.setToolTip(tr('单个方格的宽×高，单位毫米；例如25×25。定向可全部留空。'))
+        fields.addWidget(size_label)
+        fields.addWidget(self.board_square)
+        fields.addWidget(label('×'))
+        fields.addWidget(self.board_square_height)
+        for field in (self.board_square, self.board_square_height):
+            field.setValidator(QDoubleValidator(0, 500, 2, field))
+            field.setPlaceholderText('')
+            field.setToolTip(tr('单个方格的宽×高，单位毫米；例如25×25。定向可全部留空。'))
+        for field in (self.board_cols, self.board_rows, self.board_square, self.board_square_height):
+            field.setFixedWidth(56)
+        fields.addStretch()
+        self.board_options_timer = QTimer(self)
+        self.board_options_timer.setSingleShot(True)
+        self.board_options_timer.setInterval(500)
+        self.board_options_timer.timeout.connect(self.environment_board_options_changed)
+        for field in (self.board_cols, self.board_rows, self.board_square, self.board_square_height):
+            field.textChanged.connect(lambda *_: self.board_options_timer.start())
+        self.board_fields.hide()
+        mode_row.addWidget(self.board_fields, 1)
         self.env_mode = PositionSwitch((tr('自动'), tr('手动')), False)
         self.env_mode.changed.connect(self.environment_mode_changed)
         mode_row.addStretch()
@@ -309,6 +392,7 @@ class Window(QMainWindow):
         box.addLayout(actions)
         self.env_message = label(tr('尚未设置 · 相机默认参考。选择类别后保持场景静止，等待稳定候选；移入轮廓预览，左键确认。'), 'muted')
         self.env_message.setWordWrap(True)
+        self.env_message.setMinimumHeight(2 * self.env_message.fontMetrics().lineSpacing() + 6)
         box.addWidget(self.env_message)
         self.env_blink = False
         self.env_blink_timer = QTimer(self)
@@ -322,7 +406,19 @@ class Window(QMainWindow):
         self.pages.addWidget(widget)
         self.paint_environment_buttons()
 
+    def environment_board_options_changed(self):
+        if self.env_worker:
+            fields = (self.board_cols, self.board_rows, self.board_square, self.board_square_height)
+            if any(field.text() and not field.hasAcceptableInput() for field in fields):
+                self.env_worker.command('board_options', {'invalid': True})
+                return
+            size = self.board_square.locale().toDouble(self.board_square.text())[0] if self.board_square.text() else 0.
+            height = self.board_square_height.locale().toDouble(self.board_square_height.text())[0] if self.board_square_height.text() else 0.
+            self.env_worker.command('board_options', dict(cols=int(self.board_cols.text() or 0), rows=int(self.board_rows.text() or 0), square_mm=[size, height] if size or height else None))
+
     def environment_board_changed(self, checked):
+        self.board_fields.setVisible(checked)
+        self.environment_board_options_changed()
         for camera in self.env_cameras:
             camera.reset_polygon()
             camera.selecting = False
@@ -330,7 +426,7 @@ class Window(QMainWindow):
         if self.env_worker:
             self.env_worker.command('board', checked)
         else:
-            self.env_message.setText(tr('开启相机，将25毫米棋盘格贴平在目标表面，再选择类别。') if checked else tr('自然平面模式。'))
+            self.env_message.setText(tr('开启相机，将棋盘格贴在目标表面，再选择类别；留空自动识别。') if checked else tr('自然平面模式。'))
 
     def environment_busy_tick(self):
         if self.env_manual_busy:
@@ -427,14 +523,30 @@ class Window(QMainWindow):
     def ensure_environment_worker(self):
         if self.env_worker and self.env_worker.isRunning():
             return True
-        if not self.camera_ready:
+        if not self.camera_ready or not self.worker:
+            self.env_message.setText(tr('请点击上方“相机开启”，画面稳定后再选择基准。'))
             return False
-        self.env_worker = EnvironmentWorker(ROOT / self.config['calibration'])
+        if not self.worker.metric_ready:
+            message = tr('环境检测尚未启动：请到左侧相机配置→结果与导入，核对并启用当前设备的标定，再保存配置。')
+            details = getattr(self.worker, 'calibration_error', '')
+            if details: message += '\n' + details
+            self.env_message.setText(message)
+            self.environment_error(message)
+            return False
+        try:
+            self.env_worker = EnvironmentWorker(ROOT / self.config['calibration'])
+        except Exception as error:
+            self.env_worker = None
+            message = tr('环境分析启动失败：') + str(error)
+            self.env_message.setText(message)
+            self.environment_error(message)
+            return False
         self.env_worker.updated.connect(self.environment_updated)
         self.env_worker.motion_detected.connect(self.environment_moved)
         self.env_worker.manual_result.connect(self.manual_environment_result)
         self.env_worker.manual_progress.connect(self.environment_progress)
         self.env_worker.command('mode', self.env_mode.relative)
+        self.environment_board_options_changed()
         self.env_worker.command('board', self.env_board.isChecked())
         self.env_worker.command('page', self.page_is('environment'))
         self.env_worker.start()
@@ -443,6 +555,7 @@ class Window(QMainWindow):
     def env_controls_enabled(self, enabled):
         self.env_mode.setEnabled(enabled)
         self.env_board.setEnabled(enabled)
+        self.board_fields.setEnabled(enabled)
         for b in list(self.env_buttons.values()) + [self.env_clear]:
             b.setEnabled(enabled)
         for camera in self.env_cameras:
@@ -557,14 +670,21 @@ class Window(QMainWindow):
         self.curve_plots = []
         self.curve_lines = []
         for axis, color in zip('XYZ', ['#d95b66', '#2b9b7b', '#377ee3']):
-            plot = pg.PlotWidget(background='white')
+            plot = pg.PlotWidget(background='white', axisItems={'left': CenteredAxisItem('left')})
             plot.showGrid(x=True, y=True, alpha=0.12)
+            plot.getAxis('left').setStyle(maxTickLevel=0)
+            plot.getAxis('bottom').setStyle(maxTickLevel=0)
+            plot.getAxis('left').enableAutoSIPrefix(False)
+            plot.getAxis('bottom').enableAutoSIPrefix(False)
             plot.setLabel('left', axis, units='mm')
             plot.setLabel('bottom', tr('时间'), units='s')
             plot.getAxis('left').setWidth(75)
             plot.setMenuEnabled(False)
             self.curve_plots.append(plot)
-            self.curve_lines.append(plot.plot(pen=pg.mkPen(color, width=1.5), connect='finite'))
+            line = plot.plot(pen=pg.mkPen(color, width=1), connect='finite', antialias=False)
+            line.setClipToView(True)
+            line.setDownsampling(auto=True, method='peak')
+            self.curve_lines.append(line)
             box.addWidget(plot, 1)
         self.pages.addWidget(widget)
 
@@ -716,7 +836,7 @@ class Window(QMainWindow):
         self.depth_max.setValue(self.config['depth_max_m'])
         form.addRow(tr('最近探测距离（未验证）'), self.depth_min)
         form.addRow(tr('最远探测距离（未验证）'), self.depth_max)
-        form.addRow(tr('相机设备编号'), self.camera_index)
+        self.camera_index.hide()
         form.addRow(tr('视频录制'), self.video)
         form.addRow(tr('深度诊断'), self.diagnostic_images)
         self.stop_on_motion = QCheckBox(tr('确认相机移动后自动停止检测'))
@@ -726,7 +846,8 @@ class Window(QMainWindow):
         self.coordinate_mode.addItems([tr('面对相机：本人右 / 靠近相机 / 上为正')])
         self.coordinate_mode.setCurrentIndex(1 if self.config.get('display_alignment') == 'hand_estimate' else 0)
         self.coordinate_mode.hide()
-        form.addRow(tr('采集模式'), label(tr('2560 × 960 · MJPG · 请求60 FPS')))
+        self.camera_summary = label(self.camera_configuration_text())
+        form.addRow(tr('采集模式'), self.camera_summary)
         pb.addLayout(form)
         box.addWidget(panel)
         self.frame_tip = label('', 'muted')
@@ -740,6 +861,35 @@ class Window(QMainWindow):
         box.addLayout(row)
         box.addStretch()
         self.pages.addWidget(widget)
+
+    def camera_configuration_text(self):
+        from camera_setup import profile
+        p = profile(self.config)
+        return f"#{p['camera_index']} · {p['camera_width']} × {p['camera_height']} · {p['camera_format']} · {p['camera_fps']} FPS · {p['camera_layout']}"
+
+    def make_camera_setup(self):
+        from camera_dialog import CameraSetupPage
+        widget,box=page(tr('相机配置'),tr('连接相机、采集标定图，或导入此设备的标定参数。'))
+        self.camera_setup=CameraSetupPage(self.config,self)
+        self.camera_setup.can_access=lambda:self.worker is None and not self.camera_closing and not self.detecting and not self.pending_start
+        self.camera_setup.applied.connect(self.apply_camera_configuration)
+        box.addWidget(self.camera_setup,1);self.pages.addWidget(widget)
+
+    def configure_camera(self):
+        self.navigate('camera_setup')
+
+    def apply_camera_configuration(self,config):
+        if self.worker:return
+        if self.env_worker:
+            self.env_worker.stop()
+            if not self.env_worker.wait(3000):
+                self.show_error(tr('环境分析正在结束，请稍后重试。'));return
+            self.env_worker=None
+        self.config.update(config);self.camera_index.setValue(self.config['camera_index'])
+        self.env_snapshot=None;self.environment_invalid=False
+        self.clear_environment();self.apply_display_frame()
+        self.camera_summary.setText(self.camera_configuration_text())
+        if self.save_settings():self.camera_setup.mark_saved(self.config)
 
     def rotation_for_report(self, report):
         saved = report.get('environment_reference') or {}
@@ -780,7 +930,7 @@ class Window(QMainWindow):
         selected = self.language.currentData()
         if selected == self.config.get('language', 'en'):
             return
-        if self.worker or self.env_worker:
+        if self.worker or self.env_worker or self.camera_setup.has_work():
             self.language.blockSignals(True)
             self.language.setCurrentIndex(0 if self.config.get('language') == 'zh_CN' else 1)
             self.language.blockSignals(False)
@@ -802,12 +952,16 @@ class Window(QMainWindow):
     def navigate(self, index, from_replay=False):
         if isinstance(index, int):
             index = ['monitor', 'curves', 'monitor', 'precision', 'records', 'replay', 'settings'][index]
+        if index == 'camera_setup' and (self.detecting or self.pending_start or self.stopping_record):
+            self.show_error(tr('请先停止检测并保存，再配置相机。'));return
+        if index != 'camera_setup':self.camera_setup.stop_preview()
         if index == 'replay' and (self.detecting or self.pending_start or self.stopping_record):
             QMessageBox.information(self, tr('请先停止检测'), tr('回放历史数据前，请先点击右下角“停止检测”。'))
             return
         if self.expanded:
             self.leave_expand()
         self.pages.setCurrentIndex(self.page_ids.index(index))
+        self.start_btn.setVisible(index != 'camera_setup');self.stop_btn.setVisible(index != 'camera_setup')
         if self.env_worker:
             self.env_worker.command('page', index == 'environment')
         self.curve_from_replay = index == 'curves' and from_replay
@@ -817,6 +971,10 @@ class Window(QMainWindow):
             b.setIcon(icon(self.nav_icons[i], '#245cb0' if self.page_ids[i] == index else '#61718a'))
         if index != 'replay':
             self.pause_replay()
+        if index == 'curves':
+            self.update_curves()
+        if index == 'monitor' and self.live:
+            self.trajectory.set_samples(list(self.live))
         if index == 'records':
             self.refresh_records()
         if index == 'precision':
@@ -907,6 +1065,8 @@ class Window(QMainWindow):
             self.open_camera()
 
     def open_camera(self):
+        if self.camera_setup.has_work():
+            self.show_error(tr('相机配置预览或后台任务尚未结束，请稍候。'));return False
         if self.worker:
             return True
         if not self.save_settings():
@@ -935,7 +1095,7 @@ class Window(QMainWindow):
         self.camera_button.setText(tr('相机关闭'))
         self.camera_button.setIcon(icon('camera', '#14875e'))
         self.camera_button.setToolTip(tr('关闭相机；正在检测时会先完成保存'))
-        self.start_btn.setEnabled(not self.pending_start)
+        self.start_btn.setEnabled(False)
         if not self.pending_start:
             self.state.setText(tr('相机预览 · 可选择目标'))
 
@@ -949,6 +1109,9 @@ class Window(QMainWindow):
             if not self.save_settings():
                 return
         elif not self.open_camera():
+            return
+        if not self.worker.metric_ready:
+            self.show_error(tr('请先开启相机预览；实际尺寸和标定核对通过后才能检测。') + ' ' + self.worker.calibration_error)
             return
         self.pause_replay()
         self.navigate('monitor')
@@ -1105,7 +1268,7 @@ class Window(QMainWindow):
             if self.page_is('environment'):
                 for w, im in zip(self.env_cameras, packet['views']):
                     w.set_frame(im)
-            if self.env_worker and (self.page_is('environment') or self.env_snapshot) and (time.perf_counter() - self.last_env_submit > 0.35):
+            if packet.get('metric_ready', False) and self.env_worker and (self.page_is('environment') or self.env_snapshot) and (time.perf_counter() - self.last_env_submit > 0.35):
                 self.last_env_submit = time.perf_counter()
                 self.env_worker.submit(packet['views'], packet.get('host_read_complete_ns', time.perf_counter_ns()))
             if self.toggles['images'].isChecked() and self.page_is('monitor'):
@@ -1116,9 +1279,14 @@ class Window(QMainWindow):
                 self.status.setText(tr('采集 {0:.1f} Hz   ·   有效三维 {1:.1f} Hz   ·   有效率 {2:.1%}   ·   自动保存中').format(packet['capture_hz'], packet['valid_hz'], packet['valid_ratio']))
             elif not self.pending_start and (not self.stopping_record) and (not self.camera_closing):
                 self.state.setText(tr('停止') if self.was_stopped else tr('相机预览 · 可选择目标'))
+                self.start_btn.setEnabled(packet.get('metric_ready', False))
+                if not packet.get('metric_ready', False):
+                    self.state.setText(tr('未标定 · 仅原始预览'))
+                    self.status.setText(tr('请在左侧相机配置中核对设备并完成标定。') + ' ' + packet.get('calibration_error', ''))
+                    return
                 selected = sum((d is not None for d in packet['detections']))
                 self.status.setText(tr('相机预览 {0:.1f} Hz · 目标已选 {1}/2 · 未记录实验').format(packet['capture_hz'], selected))
-        if samples:
+        if samples and self.page_is('monitor') and self.toggles['trajectory'].isChecked():
             self.trajectory.set_samples(list(self.live))
 
     def tick(self):
@@ -1139,22 +1307,37 @@ class Window(QMainWindow):
                 self.pause_replay()
 
     def update_curves(self):
-        samples = list(self.live) if self.curve_source.currentIndex() == 0 else self.history_samples
-        if not samples:
-            return
         history = self.curve_source.currentIndex() != 0
+        source = self.history_samples if history else self.live
         relative = self.replay_view.relative if history else self.trajectory.relative
         denoise = self.replay_view.denoise if history else self.trajectory.denoise
+        rotation = self.history_rotation if history else self.display_rotation
+        last = source[-1] if source else None
+        signature = (id(source), len(source), id(last), relative, denoise, np.asarray(rotation).tobytes())
+        if signature == self._curve_key:
+            return False
+        self._curve_key = signature
+        samples = list(source)
+        labels = ['XYZ'[i] + (tr(' 相对') if relative else tr(' 绝对')) + (tr(' 降噪') if denoise else tr(' 原始')) for i in range(3)]
+        for plot, text in zip(self.curve_plots, labels):
+            if plot.getAxis('left').labelText != text:
+                plot.setLabel('left', text, units='mm')
+        if not samples:
+            for line in self.curve_lines:
+                line.setData([], [])
+            return True
         if denoise:
             ensure_filtered(samples)
         origin = first_origin(samples) if relative else None
-        times = np.array([s['t'] for s in samples])
+        times = np.fromiter((s['t'] for s in samples), dtype=float, count=len(samples))
         raw = np.array([s['filtered_xyz'] if denoise else s['xyz'] for s in samples])
-        raw = np.where(np.array([s.get('environment_valid', True) for s in samples])[:, None], raw, np.nan)
-        points = to_scene(raw - (origin if origin is not None else 0), self.history_rotation if history else self.display_rotation) * 1000
+        valid = np.array([s['valid'] and s.get('environment_valid', True) for s in samples])
+        raw[~valid] = np.nan
+        points = to_scene(raw - (origin if origin is not None else 0), rotation) * 1000
         for i, line in enumerate(self.curve_lines):
+            # Keep original arrays intact; viewport clipping / peak reduction is display only.
             line.setData(times, points[:, i], connect='finite')
-            self.curve_plots[i].setLabel('left', 'XYZ'[i] + (tr(' 相对') if relative else tr(' 绝对')) + (tr(' 降噪') if denoise else tr(' 原始')), units='mm')
+        return True
 
     def set_phase_enabled(self, value):
         for b in self.phase_buttons:
@@ -1420,7 +1603,15 @@ class Window(QMainWindow):
         logging.error(text)
         QMessageBox.warning(self, tr('操作提示'), text)
 
+    def nativeEvent(self, event_type, message):
+        guard = getattr(self, 'taskbar_guard', None)
+        if guard is not None:
+            guard.native_message(message)
+        return super().nativeEvent(event_type, message)
+
     def closeEvent(self, event):
+        if not self.camera_setup.prepare_shutdown():
+            event.ignore();self.status.setText(tr('正在结束相机配置任务，请稍候。'));QTimer.singleShot(200,self.close);return
         if self.env_worker:
             self.env_worker.stop()
             self.env_worker.wait(3000)
@@ -1436,6 +1627,8 @@ class Window(QMainWindow):
                 self.status.setText(tr('正在等待相机释放并保存，请稍后再次关闭窗口。'))
                 return
         self.pause_replay()
+        if hasattr(self, 'taskbar_guard'):
+            self.taskbar_guard.timer.stop()
         event.accept()
 
 def main():
@@ -1444,9 +1637,12 @@ def main():
     args = parser.parse_args()
     (ROOT / 'logs').mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=ROOT / 'logs/application.log', level=logging.INFO, encoding='utf-8', format='%(asctime)s %(levelname)s %(message)s')
+    configure_windows_identity()
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName('Stereo Motion Measurement')
+    app.setOrganizationName('Siri.y')
+    app.setWindowIcon(application_icon())
     app.setFont(QFont('Microsoft YaHei', 10))
     app.setStyle('Fusion')
     app.setStyleSheet(STYLE)

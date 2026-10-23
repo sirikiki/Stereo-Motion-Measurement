@@ -18,7 +18,10 @@ FIELDS = ['host_read_complete_ns', 'phase', 'attempt', 'phase_elapsed_s', 'valid
 FIELDS += ['relative_camera_x_m', 'relative_camera_y_m', 'relative_camera_z_m', 'display_absolute_x_m', 'display_absolute_y_m', 'display_absolute_z_m', 'display_relative_x_m', 'display_relative_y_m', 'display_relative_z_m']
 FIELDS += ['filtered_camera_x_m', 'filtered_camera_y_m', 'filtered_camera_z_m']
 FIELDS += ['environment_valid']
-DEFAULTS = {'language': 'en', 'camera_index': 1, 'trail_seconds': 10, 'record_video': False, 'reference_mm': 100, 'calibration': 'calibration/stereo_calibration.npz', 'diagnostic_images': True, 'display_alignment': 'camera', 'depth_min_m': 0.2, 'depth_max_m': 3.0, 'stop_on_camera_motion': True}
+DEFAULTS = {'language': 'en', 'camera_index': 0, 'trail_seconds': 10, 'record_video': False, 'reference_mm': 100, 'calibration': '', 'diagnostic_images': False, 'display_alignment': 'camera', 'depth_min_m': 0.2, 'depth_max_m': 3.0, 'stop_on_camera_motion': True}
+
+from camera_setup import PROFILE
+DEFAULTS.update(PROFILE, calibration_profile=None, calibration_sha256=None, camera_actual=None)
 
 def write_json(path, value):
     path = Path(path)
@@ -53,6 +56,8 @@ def settings(path=None):
                 raise ValueError(tr('显示坐标设置无效'))
             if not isinstance(loaded.get('calibration', value['calibration']), str):
                 raise ValueError(tr('标定路径无效'))
+            from camera_setup import profile
+            profile(loaded)
             value.update({k: v for k, v in loaded.items() if k in DEFAULTS})
         except (ValueError, TypeError) as error:
             backup = p.with_name('settings.invalid_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.json')

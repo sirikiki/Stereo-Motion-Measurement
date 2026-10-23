@@ -4,8 +4,9 @@ import uuid
 import cv2
 import numpy as np
 from plane_patches import project, polygon_overlap
+from environment_raster import to_work, to_full, scale_xy, area_limit, kernel
 
-def polygon_mask(points, shape=(480, 640)):
+def polygon_mask(points, shape, image_size):
     p = np.asarray(points, float)
     if p.ndim != 2 or p.shape[1] != 2 or len(p) < 3 or (not np.isfinite(p).all()):
         raise ValueError(tr('至少需要三个有效点。'))
@@ -26,12 +27,12 @@ def polygon_mask(points, shape=(480, 640)):
                 if max(min(a[0], b[0]), min(c[0], d[0])) <= min(max(a[0], b[0]), max(c[0], d[0])) and max(min(a[1], b[1]), min(c[1], d[1])) <= min(max(a[1], b[1]), max(c[1], d[1])):
                     raise ValueError(tr('边线交叉，无法构成有效区域，请重新圈选。'))
     h, w = shape
-    if (p < 0).any() or (p[:, 0] >= w * 2).any() or (p[:, 1] >= h * 2).any():
+    if (p < 0).any() or (p[:, 0] >= image_size[0]).any() or (p[:, 1] >= image_size[1]).any():
         raise ValueError(tr('圈选点超出影像。'))
-    if abs(cv2.contourArea(p.astype(np.float32))) < 1600:
+    if abs(cv2.contourArea(p.astype(np.float32))) < max(64, 1600 * image_size[0] * image_size[1] / (1280 * 960)):
         raise ValueError(tr('圈选区域过小，请扩大到一块平整表面。'))
     mask = np.zeros(shape, np.uint8)
-    cv2.fillPoly(mask, [np.rint(p / 2).astype(np.int32)], 1)
+    cv2.fillPoly(mask, [np.rint(to_work(p, shape, image_size)).astype(np.int32)], 1)
     return mask.astype(bool)
 
 def fit_inverse(points, threshold, seed=44, check_spatial=True):
@@ -107,7 +108,7 @@ def eligible(normal, kind, up=None):
     dot = abs(np.asarray(normal) @ up)
     return dot >= np.cos(np.radians(40)) if kind == 'horizontal' else dot <= np.sin(np.radians(40))
 
-def make_geometry(fit, mask, P1, P2, polygon=None, side=0, manual=False):
+def make_geometry(fit, mask, P1, P2, polygon=None, side=0, manual=False, *, image_size):
     n = fit['normal']
     offset = fit['offset']
     center = fit['center']
@@ -117,16 +118,16 @@ def make_geometry(fit, mask, P1, P2, polygon=None, side=0, manual=False):
         if not contours:
             return None
         contour = cv2.convexHull(max(contours, key=cv2.contourArea))
-        if cv2.contourArea(contour) < 400:
+        if cv2.contourArea(contour) < area_limit(400, mask.shape):
             return None
-        polygon = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True).reshape(-1, 2) * 2
+        polygon = to_full(cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True).reshape(-1, 2), mask.shape, image_size)
     polygon = np.asarray(polygon, float)
     display_mask = np.zeros(mask.shape, np.uint8)
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         cv2.drawContours(display_mask, [cv2.convexHull(max(contours, key=cv2.contourArea))], -1, 1, cv2.FILLED)
-    display_mask = cv2.morphologyEx(display_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
-    display_mask = cv2.dilate(display_mask, np.ones((7, 7), np.uint8)).astype(bool)
+    display_mask = cv2.morphologyEx(display_mask, cv2.MORPH_CLOSE, np.ones((kernel(11, mask.shape),) * 2, np.uint8))
+    display_mask = cv2.dilate(display_mask, np.ones((kernel(7, mask.shape),) * 2, np.uint8)).astype(bool)
     camera_center = np.array([-P2[0, 3] / P2[0, 0], 0, 0]) if side else np.zeros(3)
     rays = np.c_[polygon, np.ones(len(polygon))] @ np.linalg.inv(K).T
     denom = rays @ n
@@ -137,7 +138,7 @@ def make_geometry(fit, mask, P1, P2, polygon=None, side=0, manual=False):
         return None
     if manual:
         mask = np.zeros(mask.shape, np.uint8)
-        cv2.fillPoly(mask, [np.rint(project(vertices, P1) / 2).astype(np.int32)], 1)
+        cv2.fillPoly(mask, [np.rint(to_work(project(vertices, P1), mask.shape, image_size)).astype(np.int32)], 1)
         mask = mask.astype(bool)
     tangent = np.array([1.0, 0, 0])
     tangent -= n * (tangent @ n)
@@ -157,7 +158,7 @@ def make_geometry(fit, mask, P1, P2, polygon=None, side=0, manual=False):
             b = hi.copy()
             a[axis] = b[axis] = lo[axis] + fraction * (hi[axis] - lo[axis])
             points = center + np.linspace(a, b, 160) @ basis
-            uv = project(points, P1) / 2
+            uv = to_work(project(points, P1), mask.shape, image_size)
             xy = np.rint(uv).astype(int)
             inside = (xy[:, 0] >= 0) & (xy[:, 0] < mask.shape[1]) & (xy[:, 1] >= 0) & (xy[:, 1] < mask.shape[0])
             inside[inside] &= display_mask[xy[inside, 1], xy[inside, 0]]
@@ -171,11 +172,12 @@ def make_geometry(fit, mask, P1, P2, polygon=None, side=0, manual=False):
     lines = np.array(lines)
     return dict(id=uuid.uuid4().hex, normal=n.tolist(), offset_m=float(offset), center_m=center.tolist(), vertices_3d_m=vertices.tolist(), grid_3d_m=lines.tolist(), polygons=[project(vertices, P).tolist() for P in [P1, P2]], grids=[project(lines.reshape(-1, 3), P).reshape(-1, 2, 2).tolist() for P in [P1, P2]], draw_boundary=manual, quality=dict(rms_mm=fit['rms'] * 1000, inliers=int(fit['keep'].sum()), normal_spread_deg=fit['spread'], spatial_normal_spread_deg=fit.get('spatial_spread', 0.0), method='inverse_depth_spatially_checked_fit', manual=manual), score=float(mask.sum() / (1 + fit['rms'] * 1000)))
 
-def automatic_planes(xyz, kind, P1, P2, search_local=True):
-    cloud = xyz[::3, ::3]
+def automatic_planes(xyz, kind, P1, P2, search_local=True, *, image_size):
+    step = max(1, round(3 * min(xyz.shape[1]/640, xyz.shape[0]/480)))
+    cloud = xyz[::step, ::step]
     valid = np.isfinite(cloud).all(axis=2)
     points = cloud[valid]
-    threshold = 0.45 / (abs(P2[0, 3]) * 0.5)
+    threshold = 0.45 / (abs(P2[0, 3]) * scale_xy(xyz.shape, image_size)[0])
     result = []
     for attempt in range(6):
         if len(points) < 200:
@@ -191,15 +193,15 @@ def automatic_planes(xyz, kind, P1, P2, search_local=True):
         b = xyz[:, :, 1] / xyz[:, :, 2]
         residual = abs(a * fit['model'][0] + b * fit['model'][1] + fit['model'][2] - 1 / xyz[:, :, 2])
         supported = all_valid & (residual < threshold)
-        mask = cv2.morphologyEx(supported.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8))
+        mask = cv2.morphologyEx(supported.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((kernel(21, xyz.shape),) * 2, np.uint8))
         bad = (all_valid & (residual > threshold * 3)).astype(np.uint8)
         _, bad_labels, bad_stats, _ = cv2.connectedComponentsWithStats(bad, 8)
         for index in range(1, len(bad_stats)):
-            if bad_stats[index, cv2.CC_STAT_AREA] >= 150:
+            if bad_stats[index, cv2.CC_STAT_AREA] >= area_limit(150, xyz.shape):
                 mask[bad_labels == index] = 0
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
         for label in np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1][:3] + 1:
-            if stats[label, cv2.CC_STAT_AREA] < 1200:
+            if stats[label, cv2.CC_STAT_AREA] < area_limit(1200, xyz.shape):
                 continue
             component = labels == label
             local_points = xyz[component & supported][::3]
@@ -211,9 +213,9 @@ def automatic_planes(xyz, kind, P1, P2, search_local=True):
             local_residual = abs(a * local_fit['model'][0] + b * local_fit['model'][1] + local_fit['model'][2] - 1 / xyz[:, :, 2])
             actual_support = component & all_valid & (local_residual < threshold)
             sy, sx = np.nonzero(actual_support)
-            if len(sx) < 750 or np.ptp(sx) < 45 or np.ptp(sy) < 25:
+            if len(sx) < area_limit(750, xyz.shape) or np.ptp(sx) < 45*xyz.shape[1]/640 or np.ptp(sy) < 25*xyz.shape[0]/480:
                 continue
-            p = make_geometry(local_fit, component, P1, P2)
+            p = make_geometry(local_fit, component, P1, P2, image_size=image_size)
             if p:
                 p['quality']['measured_support_pixels'] = int(len(sx))
                 p['score'] = float(len(sx) / (1 + local_fit['rms'] * 1000 + local_fit['spatial_spread']))
@@ -229,20 +231,20 @@ def automatic_planes(xyz, kind, P1, P2, search_local=True):
             region = xyz.copy()
             region[:y0] = np.nan
             region[y1:] = np.nan
-            unique.extend(automatic_planes(region, kind, P1, P2, False))
+            unique.extend(automatic_planes(region, kind, P1, P2, False, image_size=image_size))
             if unique:
                 break
     return unique[:4]
 
-def manual_plane(xyz, polygon, side, kind, P1, P2):
+def manual_plane(xyz, polygon, side, kind, P1, P2, *, image_size):
     """Use the polygon as a bounded search hint, never as a coplanarity claim."""
-    selected = polygon_mask(polygon, xyz.shape[:2])
-    nearby = cv2.dilate(selected.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (97, 97))).astype(bool)
+    selected = polygon_mask(polygon, xyz.shape[:2], image_size)
+    nearby = cv2.dilate(selected.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(97, selected.shape),) * 2)).astype(bool)
     valid = np.isfinite(xyz).all(axis=2)
     search = nearby.copy()
     if side:
         search = np.zeros_like(valid)
-        uv = project(xyz[valid], P2) / 2
+        uv = to_work(project(xyz[valid], P2), xyz.shape, image_size)
         xy = np.rint(uv).astype(int)
         inside = (xy[:, 0] >= 0) & (xy[:, 0] < nearby.shape[1]) & (xy[:, 1] >= 0) & (xy[:, 1] < nearby.shape[0])
         chosen = np.zeros(len(xy), bool)
@@ -250,20 +252,20 @@ def manual_plane(xyz, polygon, side, kind, P1, P2):
         search[valid] = chosen
     local = xyz.copy()
     local[~search] = np.nan
-    candidates = automatic_planes(local, kind, P1, P2)
-    candidates += automatic_planes(xyz, kind, P1, P2)
-    return select_hint(candidates, polygon, side, xyz.shape[:2])
+    candidates = automatic_planes(local, kind, P1, P2, image_size=image_size)
+    candidates += automatic_planes(xyz, kind, P1, P2, image_size=image_size)
+    return select_hint(candidates, polygon, side, xyz.shape[:2], image_size)
 
-def select_hint(candidates, polygon, side, shape=(480, 640)):
-    selected = polygon_mask(polygon, shape)
-    nearby = cv2.dilate(selected.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (97, 97))).astype(bool)
+def select_hint(candidates, polygon, side, shape, image_size):
+    selected = polygon_mask(polygon, shape, image_size)
+    nearby = cv2.dilate(selected.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(97, selected.shape),) * 2)).astype(bool)
     ranked = []
     for plane in candidates:
         mask = np.zeros(selected.shape, np.uint8)
-        cv2.fillPoly(mask, [np.rint(np.asarray(plane['polygons'][side]) / 2).astype(np.int32)], 1)
+        cv2.fillPoly(mask, [np.rint(to_work(plane['polygons'][side], shape, image_size)).astype(np.int32)], 1)
         overlap = int(np.count_nonzero(mask.astype(bool) & selected))
         near = int(np.count_nonzero(mask.astype(bool) & nearby))
-        if overlap < 150 and near < 600:
+        if overlap < area_limit(150, shape) and near < area_limit(600, shape):
             continue
         score = overlap * 4 + near * 0.25
         ranked.append((score, plane))
@@ -274,5 +276,5 @@ def select_hint(candidates, polygon, side, shape=(480, 640)):
     plane['quality']['selection_method'] = 'hint_guided_automatic_search'
     plane['hint_polygon'] = polygon
     plane['hint_side'] = int(side)
-    plane['search_margin_pixels'] = 96
+    plane['search_margin_pixels'] = ((kernel(97, shape)-1) / (2*scale_xy(shape, image_size))).tolist()
     return plane

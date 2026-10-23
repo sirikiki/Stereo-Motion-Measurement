@@ -1,13 +1,23 @@
 {
   "language": "en",
-  "camera_index": 1,
+  "camera_index": 0,
+  "camera_backend": "AUTO",
+  "camera_width": 1280,
+  "camera_height": 480,
+  "camera_fps": 30,
+  "camera_format": "DEFAULT",
+  "camera_layout": "sbs",
+  "camera_swap": false,
   "trail_seconds": 10,
   "record_video": false,
   "reference_mm": 100,
-  "calibration": "calibration/stereo_calibration.npz",
-  "diagnostic_images": true,
+  "calibration": "",
+  "diagnostic_images": false,
   "display_alignment": "camera",
   "depth_min_m": 0.2,
-  "depth_max_m": 3,
-  "stop_on_camera_motion": true
+  "depth_max_m": 3.0,
+  "stop_on_camera_motion": true,
+  "calibration_profile": null,
+  "calibration_sha256": null,
+  "camera_actual": null
 }

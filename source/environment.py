@@ -7,9 +7,11 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 from coordinates import CAMERA_TO_SCENE
 from stereo_reconstruction import StereoGeometry
-from plane_patches import connected_candidates, StableCandidates, PlaneVisibility
+from plane_patches import StableCandidates, PlaneVisibility
 from plane_selection import automatic_planes, manual_plane, select_hint, fit_inverse
 from board_reference import BoardReference
+from image_quality import observations, hint as image_quality_hint
+from environment_raster import analysis_size, scale_xy, to_work, to_full, sample_image, checked_views
 
 def depth_median(history, K):
     """Exact per-pixel finite median, without per-empty-pixel warning handling."""
@@ -113,16 +115,40 @@ class StereoPlanes:
 
     def __init__(self, geometry):
         self.geometry = geometry
-        self.size = (640, 480)
+        p1,p2=geometry.parameters['P1'],geometry.parameters['P2']
+        if (min(p1[0,0],p1[1,1]) <= 0 or
+            not np.allclose(p1[2,:3],[0,0,1],atol=1e-8) or
+            not np.allclose([p1[0,1],p1[1,0]],0,atol=1e-8) or
+            not np.allclose(p1[:,:3],p2[:,:3],atol=1e-6) or
+            not np.allclose(p1[:,3],0,atol=1e-8) or
+            not np.allclose(p2[1:,3],0,atol=1e-8) or p2[0,3]>=0):
+            raise ValueError(tr('环境深度需要水平、零视差校正参数，请在相机配置中重新导入或生成标定。'))
+        self.size = analysis_size(geometry.size)
+        self.scale = scale_xy(self.size[::-1], geometry.size)
         self.matcher = cv2.StereoSGBM_create(minDisparity=0, numDisparities=192, blockSize=5, P1=200, P2=800, disp12MaxDiff=1, preFilterCap=31, uniquenessRatio=12, speckleWindowSize=80, speckleRange=2, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         self.right_matcher = cv2.StereoSGBM_create(minDisparity=-192, numDisparities=192, blockSize=5, P1=200, P2=800, disp12MaxDiff=1, preFilterCap=31, uniquenessRatio=12, speckleWindowSize=80, speckleRange=2, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         self.K = self.geometry.parameters['P1'][:, :3].copy()
-        self.K[:2] *= 0.5
+        self.K[:2] *= self.scale[:, None]
         self.baseline = float(abs(self.geometry.parameters['P2'][0, 3] / self.geometry.parameters['P2'][0, 0]))
         self.far_matcher = cv2.StereoSGBM_create(minDisparity=0, numDisparities=64, blockSize=9, P1=648, P2=2592, uniquenessRatio=12, speckleWindowSize=80, speckleRange=1, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         self.far_right = cv2.StereoSGBM_create(minDisparity=-64, numDisparities=64, blockSize=9, P1=648, P2=2592, uniquenessRatio=12, speckleWindowSize=80, speckleRange=1, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         self.normalized_matcher = cv2.StereoSGBM_create(minDisparity=0, numDisparities=192, blockSize=15, P1=1800, P2=7200, uniquenessRatio=12, speckleWindowSize=80, speckleRange=1, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         self.normalized_right = cv2.StereoSGBM_create(minDisparity=-192, numDisparities=192, blockSize=15, P1=1800, P2=7200, uniquenessRatio=12, speckleWindowSize=80, speckleRange=1, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
+        for m in (self.matcher, self.right_matcher, self.far_matcher, self.far_right, self.normalized_matcher, self.normalized_right):
+            # Range follows f*B/Z, bounded by image width for SGBM.
+            near = 0.6 if m in (self.far_matcher, self.far_right) else 0.2
+            desired = int(np.ceil((self.K[0, 0]*self.baseline/near + 16)/16))*16
+            count = max(16, min(desired, ((self.size[0] - 32) // 16) * 16))
+            m.setNumDisparities(count)
+            if m.getMinDisparity() < 0: m.setMinDisparity(-count)
+        self.depth_limits_m = (0.2, 5.0)
+        self.sampling_info = dict(image_size=list(geometry.size), analysis_size=list(self.size),
+            scale_xy=self.scale.tolist(), focal_px=float(self.K[0,0]), baseline_m=self.baseline,
+            disparity_count=self.matcher.getNumDisparities(),
+            nearest_searchable_m=float(self.K[0,0]*self.baseline/(self.matcher.getNumDisparities()-1)),
+            depth_limits_m=list(self.depth_limits_m), sampling='origin_preserving_remap')
+        import logging
+        logging.info('Environment sampling: %s', self.sampling_info)
         self.alternative_xyz = None
         self.depth_history = deque(maxlen=5)
         self.primary_history = deque(maxlen=5)
@@ -133,7 +159,9 @@ class StereoPlanes:
         self.selection_kind = None
 
     def depth(self, views):
-        gray = [cv2.resize(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), self.size) for im in views]
+        views = checked_views(views, self.geometry.size)
+        self.alternative_xyz = None
+        gray = [sample_image(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), self.size) for im in views]
         left = self.matcher.compute(*gray).astype(float) / 16
         right = self.right_matcher.compute(gray[1], gray[0]).astype(float) / 16
         yy, xx = np.indices(left.shape)
@@ -144,7 +172,7 @@ class StereoPlanes:
         far = self.far_matcher.compute(*gray).astype(float) / 16
         far_right = self.far_right.compute(gray[1], gray[0]).astype(float) / 16
         fxr = np.rint(xx - far).astype(int)
-        far_valid = (far > 2) & (fxr >= 0) & (fxr < 640) & (abs(far + far_right[yy, np.clip(fxr, 0, 639)]) < 1)
+        far_valid = (far > 2) & (fxr >= 0) & (fxr < self.size[0]) & (abs(far + far_right[yy, np.clip(fxr, 0, self.size[0] - 1)]) < 1)
         use = ~valid & far_valid
         left[use] = far[use]
         valid |= use
@@ -165,16 +193,16 @@ class StereoPlanes:
         nd = self.normalized_matcher.compute(*ng).astype(float) / 16
         nr = self.normalized_right.compute(ng[1], ng[0]).astype(float) / 16
         nx = np.rint(xx - nd).astype(int)
-        nv = (nd > 2) & (nx >= 0) & (nx < 640) & (abs(nd + nr[yy, np.clip(nx, 0, 639)]) < 1)
+        nv = (nd > 2) & (nx >= 0) & (nx < self.size[0]) & (abs(nd + nr[yy, np.clip(nx, 0, self.size[0] - 1)]) < 1)
         nz = self.K[0, 0] * self.baseline / np.maximum(nd, 0.001)
         nv &= (nz >= 0.2) & (nz <= 5)
         self.alternative_xyz = np.stack([(xx - self.K[0, 2]) * nz / self.K[0, 0], (yy - self.K[1, 2]) * nz / self.K[1, 1], nz], axis=2)
         self.alternative_xyz[~nv] = np.nan
-        if self.previous_gray is not None and np.mean(cv2.absdiff(gray[0], self.previous_gray) > 20) > 0.12:
+        if self.previous_gray is not None and any(np.mean(cv2.absdiff(current, previous) > 20) > 0.12 for current, previous in zip(gray, self.previous_gray)):
             self.depth_history.clear()
             self.primary_history.clear()
             self.selection_history.clear()
-        self.previous_gray = gray[0].copy()
+        self.previous_gray = [im.copy() for im in gray]
         self.primary_history.append(xyz.copy())
         self.depth_history.append(self.alternative_xyz.copy())
         if len(self.depth_history) >= 3:
@@ -184,9 +212,9 @@ class StereoPlanes:
     def candidates(self, xyz, kind):
         if kind in self.cached_candidates:
             return copy.deepcopy(self.cached_candidates[kind])
-        result = automatic_planes(xyz, kind, self.geometry.parameters['P1'], self.geometry.parameters['P2'])
+        result = automatic_planes(xyz, kind, self.geometry.parameters['P1'], self.geometry.parameters['P2'], image_size=self.geometry.size)
         if not result and self.alternative_xyz is not None:
-            result = automatic_planes(self.alternative_xyz, kind, self.geometry.parameters['P1'], self.geometry.parameters['P2'])
+            result = automatic_planes(self.alternative_xyz, kind, self.geometry.parameters['P1'], self.geometry.parameters['P2'], image_size=self.geometry.size)
             for p in result:
                 p['quality']['depth_source'] = 'local_brightness_normalized_stereo'
         self.cached_candidates[kind] = copy.deepcopy(result)
@@ -215,7 +243,7 @@ class StereoPlanes:
             update(tr('正在匹配圈选位置与已计算候选…'))
             for index, choices in enumerate(self.selection_history):
                 try:
-                    plane = select_hint(copy.deepcopy(choices), polygon, side)
+                    plane = select_hint(copy.deepcopy(choices), polygon, side, self.size[::-1], self.geometry.size)
                     locked = tracker.update([plane], index * 0.4)
                 except ValueError:
                     locked = tracker.update([], index * 0.4)
@@ -226,17 +254,17 @@ class StereoPlanes:
         update(tr('正在局部搜索圈选区域…'))
         source = self.primary_history
         try:
-            plane = manual_plane(source[-1], polygon, side, kind, P1, P2)
+            plane = manual_plane(source[-1], polygon, side, kind, P1, P2, image_size=self.geometry.size)
         except ValueError:
             update(tr('正在检查亮度增强后的局部深度…'))
             source = self.depth_history
-            plane = manual_plane(source[-1], polygon, side, kind, P1, P2)
+            plane = manual_plane(source[-1], polygon, side, kind, P1, P2, image_size=self.geometry.size)
             plane['quality']['depth_source'] = 'local_brightness_normalized_stereo'
         mask = np.zeros(source[-1].shape[:2], np.uint8)
-        cv2.fillPoly(mask, [np.rint(np.array(plane['polygons'][0]) / 2).astype(np.int32)], 1)
+        cv2.fillPoly(mask, [np.rint(to_work(plane['polygons'][0], self.size[::-1], self.geometry.size)).astype(np.int32)], 1)
         tracker.reset()
         locked = []
-        threshold = 0.45 / (abs(P2[0, 3]) * 0.5)
+        threshold = 0.45 / (abs(P2[0, 3]) * self.scale[0])
         for index, xyz in enumerate(source):
             update(tr('正在核对局部方向 ') + str(index + 1) + '/' + str(len(source)) + '…')
             points = xyz[mask.astype(bool)]
@@ -260,8 +288,9 @@ class StereoPlanes:
 
 class MotionMonitor:
 
-    def __init__(self, K):
+    def __init__(self, K, image_size, work_size):
         self.K = K
+        self.image_size, self.work_size = image_size, work_size
         self.orb = cv2.ORB_create(nfeatures=2400)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self.reset()
@@ -326,17 +355,17 @@ class MotionMonitor:
         good = [a for pair in pairs if len(pair) == 2 for a, b in [pair] if a.distance < 0.72 * b.distance]
         reverse = {m.queryIdx: m.trainIdx for m in self.matcher.match(desc, self.descriptors)}
         good = [m for m in good if reverse.get(m.trainIdx) == m.queryIdx]
-        matched = dict(empty, reference_uv=self.uv[[m.queryIdx for m in good]] * 2, current_uv=np.array([keys[m.trainIdx].pt for m in good]).reshape(-1, 2) * 2)
+        matched = dict(empty, reference_uv=to_full(self.uv[[m.queryIdx for m in good]], self.work_size[::-1], self.image_size), current_uv=to_full(np.array([keys[m.trainIdx].pt for m in good]).reshape(-1, 2), self.work_size[::-1], self.image_size))
         if len(good) < 30:
             self.streak = 0
             return matched
-        stable = np.linalg.norm(matched['reference_uv'] - matched['current_uv'], axis=1) < 3
-        stable_uv = matched['reference_uv'][stable] / 2
+        stable = np.linalg.norm(to_work(matched['reference_uv'] - matched['current_uv'], self.work_size[::-1], self.image_size), axis=1) < 1.5
+        stable_uv = to_work(matched['reference_uv'][stable], self.work_size[::-1], self.image_size)
         stable_tiles = set(((int(x >= gray.shape[1] / 2), int(y >= gray.shape[0] / 2)) for x, y in stable_uv))
         if stable.sum() >= 30 and len(stable_tiles) >= 3 and np.all(np.ptp(stable_uv, axis=0) >= np.array(gray.shape[::-1]) * 0.35):
             self.streak = 0
             self.last_pose = None
-            return dict(matched, reliable=True, inliers=int(stable.sum()), translation_m=0.0, rotation_deg=0.0, rms_px=0.0, evidence='distributed background stationary within 1.5 half-resolution pixels')
+            return dict(matched, reliable=True, inliers=int(stable.sum()), translation_m=0.0, rotation_deg=0.0, rms_px=0.0, evidence='distributed background stationary within 1.5 analysis pixels')
         indexes = np.array([m.queryIdx for m in good])
         image = np.array([keys[m.trainIdx].pt for m in good], np.float64)
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(self.points[indexes], image, self.K, np.zeros(5), iterationsCount=120, reprojectionError=2.0, confidence=0.999, flags=cv2.SOLVEPNP_ITERATIVE)
@@ -386,6 +415,8 @@ class EnvironmentWorker(QThread):
             self.condition.notify()
 
     def command(self, name, value=None):
+        if name == 'confirm':
+            value = dict(candidate_id=value, requested_at=time.perf_counter())
         if name == 'manual':
             self.manual_cancel.clear()
         self.commands.put((name, value))
@@ -417,13 +448,15 @@ class EnvironmentWorker(QThread):
         try:
             geometry = StereoGeometry(self.parameter_file)
             stereo = StereoPlanes(geometry)
-            self.monitor = MotionMonitor(stereo.K)
+            self.monitor = MotionMonitor(stereo.K, geometry.size, stereo.size)
         except Exception as error:
             self.updated.emit(dict(planes={}, selecting=None, overlays=[], candidates=[], snapshot=None, message=tr('环境分析初始化失败：') + str(error)))
             return
         stable = StableCandidates(geometry.parameters['P1'], geometry.parameters['P2'])
         visibility = {}
         board = BoardReference(geometry.parameters['P1'], geometry.parameters['P2'])
+        from board_reference import BoardCandidateGate
+        board_gate = BoardCandidateGate(geometry.parameters['P1'], geometry.parameters['P2'])
         last_work = 0
         last_depth = 0
         candidates = []
@@ -439,6 +472,15 @@ class EnvironmentWorker(QThread):
                 name, value = self.commands.get_nowait()
                 if name == 'page':
                     self.page_active = bool(value)
+                elif name == 'board_options':
+                    if self.lock_selection:
+                        continue
+                    board.configure(value)
+                    candidates = []
+                    self.candidate_cache = {}
+                    stable.reset()
+                    board_gate.reset()
+                    changed = True
                 elif name == 'board':
                     if self.lock_selection:
                         continue
@@ -447,8 +489,9 @@ class EnvironmentWorker(QThread):
                     candidates = []
                     self.candidate_cache = {}
                     stable.reset()
+                    board_gate.reset()
                     changed = True
-                    message = tr('棋盘格辅助：把25毫米方格纸贴平在目标表面，再选择水平或竖直。') if self.board_mode else tr('自然平面：选择类别后等待候选，或手动圈出大致位置。')
+                    message = tr('棋盘格辅助：把棋盘格贴在目标表面，再选择水平或竖直；留空自动识别。') if self.board_mode else tr('自然平面：选择类别后等待候选，或手动圈出大致位置。')
                 elif name == 'mode':
                     if self.lock_selection:
                         continue
@@ -457,6 +500,7 @@ class EnvironmentWorker(QThread):
                     candidates = []
                     self.candidate_cache = {}
                     stable.reset()
+                    board_gate.reset()
                     changed = True
                     message = tr('手动模式：先选择水平/竖直类别，再在同一幅影像右键逐点圈选，点回首点闭合。') if self.manual_mode else tr('自动模式：选择类别后等待稳定候选。')
                 elif name == 'select':
@@ -466,6 +510,7 @@ class EnvironmentWorker(QThread):
                     candidates = []
                     self.candidate_cache = {}
                     stable.reset()
+                    board_gate.reset()
                     changed = True
                     message = tr('保持场景静止，等待多帧稳定候选；鼠标移到轮廓上预览，左键确认。') if self.selecting else tr('已取消选择，原基准保留。')
                     if self.manual_mode and self.selecting:
@@ -479,6 +524,7 @@ class EnvironmentWorker(QThread):
                     self.candidate_cache = {}
                     visibility.clear()
                     stable.reset()
+                    board_gate.reset()
                     self.monitor.reset()
                     self.publish_snapshot()
                     changed = True
@@ -486,8 +532,10 @@ class EnvironmentWorker(QThread):
                 elif name == 'confirm':
                     if self.lock_selection:
                         continue
-                    candidate = self.candidate_cache.get(value)
-                    if candidate is None or not self.selecting or candidate['kind'] != self.selecting or (time.perf_counter() - candidate['stamp'] > 2):
+                    candidate_id = value['candidate_id'] if isinstance(value, dict) else value
+                    requested_at = value['requested_at'] if isinstance(value, dict) else time.perf_counter()
+                    candidate = self.candidate_cache.get(candidate_id)
+                    if candidate is None or not self.selecting or candidate['kind'] != self.selecting or (requested_at - candidate['stamp'] > 2):
                         message = tr('候选已过期，请重新点击当前网格。')
                         changed = True
                         continue
@@ -500,19 +548,29 @@ class EnvironmentWorker(QThread):
                         changed = True
                         continue
                     first = not self.planes
+                    try:
+                        next_visibility = PlaneVisibility(candidate['plane'], candidate['views'], stereo.K)
+                        next_monitor = self.monitor
+                        if first:
+                            anchor_xyz = candidate['xyz']
+                            if anchor_xyz is None:
+                                stereo.enhance = False
+                                _, anchor_xyz = stereo.depth(candidate['views'])
+                            next_monitor = MotionMonitor(stereo.K, geometry.size, stereo.size)
+                            next_monitor.anchor(candidate['gray'], anchor_xyz)
+                    except Exception as error:
+                        message = tr('环境分析失败（已保存方向仍保留）：') + str(error)
+                        changed = True
+                        continue
                     self.planes = proposed
-                    visibility[self.selecting] = PlaneVisibility(candidate['plane'], candidate['views'], stereo.K)
-                    if first:
-                        anchor_xyz = candidate['xyz']
-                        if anchor_xyz is None:
-                            stereo.enhance = False
-                            _, anchor_xyz = stereo.depth(candidate['views'])
-                        self.monitor.anchor(candidate['gray'], anchor_xyz)
+                    self.monitor = next_monitor
+                    visibility[self.selecting] = next_visibility
                     self.publish_snapshot()
                     self.selecting = None
                     candidates = []
                     self.candidate_cache = {}
                     stable.reset()
+                    board_gate.reset()
                     changed = True
                     message = tr('基准已保存，遮挡不会清除。相机移动后请重新设置。')
                 elif name == 'manual':
@@ -523,7 +581,7 @@ class EnvironmentWorker(QThread):
                         views = value['views']
                         self.manual_progress.emit(tr('正在检查圈选位置…'))
                         if self.board_mode:
-                            plane = select_hint([copy.deepcopy(v['plane']) for v in self.candidate_cache.values()], value['points'], value['side'])
+                            plane = select_hint([copy.deepcopy(v['plane']) for v in self.candidate_cache.values()], value['points'], value['side'], stereo.size[::-1], geometry.size)
                             stereo.enhance = False
                             gray_pair, xyz = stereo.depth(views)
                         else:
@@ -531,7 +589,7 @@ class EnvironmentWorker(QThread):
                                 stereo.enhance = True
                                 gray_pair, xyz = stereo.depth(views)
                             else:
-                                gray_pair = [cv2.resize(cv2.cvtColor(v, cv2.COLOR_BGR2GRAY), (640, 480)) for v in views]
+                                gray_pair = [sample_image(cv2.cvtColor(v, cv2.COLOR_BGR2GRAY), stereo.size) for v in views]
                                 xyz = stereo.primary_history[-1]
                             plane = stereo.manual_candidate(value['points'], value['side'], self.selecting, self.manual_cancel, self.manual_progress.emit)
                         if self.manual_cancel.is_set():
@@ -540,14 +598,19 @@ class EnvironmentWorker(QThread):
                         proposed[self.selecting] = plane
                         reference_rotation(proposed)
                         first = not self.planes
-                        self.planes = proposed
-                        visibility[self.selecting] = PlaneVisibility(plane, views, stereo.K)
+                        next_visibility = PlaneVisibility(plane, views, stereo.K)
+                        next_monitor = self.monitor
                         if first:
-                            self.monitor.anchor(gray_pair[0], xyz)
+                            next_monitor = MotionMonitor(stereo.K, geometry.size, stereo.size)
+                            next_monitor.anchor(gray_pair[0], xyz)
+                        self.planes = proposed
+                        self.monitor = next_monitor
+                        visibility[self.selecting] = next_visibility
                         self.publish_snapshot()
                         self.selecting = None
                         candidates = []
                         stable.reset()
+                        board_gate.reset()
                         message = tr('手动基准已确认并保存。')
                         self.manual_result.emit(dict(ok=True, message=message))
                     except Exception as error:
@@ -565,7 +628,8 @@ class EnvironmentWorker(QThread):
                 last_work = now
                 views, ns = current
                 try:
-                    gray = cv2.resize(cv2.cvtColor(views[0], cv2.COLOR_BGR2GRAY), (640, 480))
+                    views = checked_views(views, geometry.size)
+                    gray = sample_image(cv2.cvtColor(views[0], cv2.COLOR_BGR2GRAY), stereo.size)
                     motion = self.monitor.check(gray) if self.planes else {}
                     if motion.get('moved'):
                         details = {k: v for k, v in motion.items() if k not in ['reference_uv', 'current_uv']}
@@ -576,6 +640,7 @@ class EnvironmentWorker(QThread):
                         self.candidate_cache = {}
                         visibility.clear()
                         stable.reset()
+                        board_gate.reset()
                         self.monitor.reset()
                         self.publish_snapshot()
                         self.motion_detected.emit(details)
@@ -584,22 +649,32 @@ class EnvironmentWorker(QThread):
                     xyz = None
                     if self.selecting:
                         if self.board_mode:
-                            gray_pair = [cv2.resize(cv2.cvtColor(v, cv2.COLOR_BGR2GRAY), (640, 480)) for v in views]
+                            gray_pair = [sample_image(cv2.cvtColor(v, cv2.COLOR_BGR2GRAY), stereo.size) for v in views]
                             found = board.candidates(views, self.selecting)
                         else:
                             stereo.enhance = True
                             gray_pair, xyz = stereo.depth(views)
                             last_depth = now
                             found = stereo.observe_candidates(xyz, self.selecting)
-                        ready = stable.update(found, time.perf_counter())
+                        ready = board_gate.update(found, views, time.perf_counter()) if self.board_mode else stable.update(found, time.perf_counter())
                         self.candidate_cache = {p['id']: dict(plane=p, gray=gray_pair[0], xyz=xyz, views=views, stamp=time.perf_counter(), kind=self.selecting) for p in ready}
                         candidates = ready if not self.manual_mode else []
                         if self.board_mode:
-                            message = tr('棋盘格方向已稳定：左键选择网格；手动模式请圈住棋盘格位置。') if ready else board.message
+                            message = tr('棋盘格方向已稳定：左键选择网格；手动模式请圈住棋盘格位置。') if ready else (tr('正在复核棋盘格，短暂漏检不会立即清除稳定候选。') if board_gate.held else board.message)
+                            if ready:
+                                shape = ready[0]['quality'].get('pattern_inner', [])
+                                if len(shape) == 2:
+                                    message += tr(' 方格{0}×{1}；内角点{2}×{3}。').format(shape[0]+1, shape[1]+1, *shape)
+                            if board_gate.held and ready:
+                                message += tr(' 暂时保留：图像跟踪确认位置未变，最长4秒。')
+                            message += tr(' 本次检测{0:.2f}秒。').format(board.last_elapsed)
                         elif self.manual_mode:
                             message = tr('右键圈出大致位置，点回首点闭合；已在后台分析，确认后可取消。')
                         else:
                             message = tr('移动鼠标预览，左键确认。') if ready else tr('正在寻找稳定平面；弱纹理时可开启棋盘格辅助。')
+                        if not self.board_mode and not found:
+                            advice = image_quality_hint(observations(views))
+                            if advice: message += ' ' + advice
                     elif self.page_active and self.planes and (now - last_depth > 1.2):
                         stereo.enhance = False
                         gray_pair, xyz = stereo.depth(views)
@@ -618,6 +693,14 @@ class EnvironmentWorker(QThread):
                 except Exception as error:
                     candidates = []
                     self.candidate_cache = {}
+                    stable.reset()
+                    board_gate.reset()
+                    stereo.primary_history.clear()
+                    stereo.depth_history.clear()
+                    stereo.selection_history.clear()
+                    stereo.cached_candidates.clear()
+                    stereo.alternative_xyz = None
+                    stereo.previous_gray = None
                     message = tr('环境分析失败（已保存方向仍保留）：') + str(error)
                     emit_state()
             elif changed:

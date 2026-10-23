@@ -11,7 +11,8 @@ class StereoGeometry:
         self.max_depth = max_depth
         with np.load(Path(parameter_file), allow_pickle=False) as data:
             self.parameters = {key: data[key].copy() for key in data.files}
-        p = self.parameters
+        from camera_setup import validate
+        p = validate(self.parameters)
         if str(p['units']) != 'm':
             raise ValueError('Calibration must use meters')
         self.size = tuple((int(x) for x in p['image_size']))
@@ -24,7 +25,12 @@ class StereoGeometry:
         if combined.shape[:2] != (height, width * 2):
             raise ValueError('Frame size differs from calibration')
         left, right = np.split(combined, 2, axis=1)
-        return [cv2.remap(image, *self.maps[side], cv2.INTER_LINEAR) for side, image in [('left', left), ('right', right)]]
+        return self.rectify_views([left, right])
+
+    def rectify_views(self, views):
+        if len(views) != 2 or any(im.shape[1::-1] != self.size for im in views):
+            raise ValueError('Frame size differs from calibration')
+        return [cv2.remap(image, *self.maps[side], cv2.INTER_LINEAR) for side, image in zip(('left', 'right'), views)]
 
     def triangulate(self, left, right):
         if left is None or right is None:
