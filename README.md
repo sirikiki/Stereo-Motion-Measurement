@@ -63,6 +63,22 @@ IMU development is separate from this desktop release. USB/BLE six-axis communic
 
 ## Quick start
 
+### Heads up — What you need before starting
+
+Prepare the following items before your first tracking session:
+
+| Item | What it is needed for |
+| --- | --- |
+| **A Windows x64 computer** | Runs the application. Tested on Windows 11; an OpenGL-capable graphics driver is required. |
+| **A compatible stereo camera and USB data cable** | The camera must appear as a single UVC device providing two equally sized views packed side by side or top/bottom. Two separate USB cameras are not currently supported. |
+| **A stable camera mount** | Keeps the stereo assembly rigid and prevents camera movement during measurement. |
+| **A solid black circular marker on a light-colored card** | The tracking target supported by the current release. Use a matte surface with a clearly visible light border around the circle. |
+| **A printed checkerboard, flat rigid backing, and ruler** | Required when creating a new stereo calibration. Print without scaling, attach the board flat, and measure the actual cell width and height. You may skip this step if you already have a compatible calibration file for your exact camera setup. |
+| **An independently measured distance or positioning guide** | Recommended for checking displacement accuracy and return repeatability after calibration. |
+| **Adequate lighting and an unobstructed shared field of view** | Both cameras must clearly see the marker. During calibration, both must see the complete checkerboard and its border. |
+
+Before choosing a camera, check the [supported hardware and calibration requirements](#hardware-and-calibration).
+
 ### Portable Windows application
 
 1. Open [Releases](https://github.com/sirikiki/Stereo-Motion-Measurement/releases) and download the versioned Windows x64 RAR asset. WinRAR or another RAR-capable extractor is required. **Code → Download ZIP** contains source code, not the ready-to-run application.
