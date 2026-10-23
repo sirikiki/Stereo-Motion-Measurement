@@ -19,7 +19,9 @@ A Windows desktop application for tracking a black circular marker, visualizing 
 
 </div>
 
-![Stereo preview, live XYZ, and 3D trajectory](docs/images/tracking.gif)
+<p align="center">
+  <img src="docs/images/tracking.gif" alt="Stereo preview, live XYZ, and 3D trajectory" width="1000">
+</p>
 
 ## Overview
 
