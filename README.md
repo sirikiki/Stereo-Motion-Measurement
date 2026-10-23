@@ -519,6 +519,18 @@ Reproducible issues are useful. Include:
 
 Distinguish captured data from synthetic inputs and preserve missing observations. Do not attach credentials or unreviewed personal footage. Source changes should explain the behavior and appropriate validation.
 
+## Support & get involved
+
+If this project is useful or interesting to you, here are a few ways to help:
+
+- ⭐ **Star** the repository to show your support.
+- 🍴 **Fork** it to experiment, customize, or contribute improvements.
+- 🐛 **Open an issue** with reproducible bugs or concrete feature requests.
+- 👀 **Watch** the repository to follow development—or select **Custom → Releases** for release updates only.
+- 💬 **Join Discussions** to ask questions, share your camera setup, and suggest ideas.
+
+Feedback from different cameras and real experiments is especially valuable to me!
+
 ## Acknowledgments and licensing
 
 - [OpenCV calibration and 3D geometry](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html): rectification, StereoSGBM, and triangulation.
